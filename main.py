@@ -226,6 +226,10 @@ if __name__ == "__main__":
 
     nodes.init_extra_nodes(init_custom_nodes=not args.disable_all_custom_nodes)
 
+    extra_nodes_path_config_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "extra_nodes_paths.yaml")
+    if os.path.isfile(extra_nodes_path_config_path):
+        load_extra_path_config(extra_nodes_path_config_path)
+
     cuda_malloc_warning()
 
     server.add_routes()
