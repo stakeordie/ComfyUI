@@ -252,11 +252,8 @@ def execute(server, dynprompt, caches, current_item, extra_data, executed, promp
     display_node_id = dynprompt.get_display_node_id(unique_id)
     parent_node_id = dynprompt.get_parent_node_id(unique_id)
     inputs = dynprompt.get_node(unique_id)['inputs']
-    class_type = dynprompt.get_node(unique_id).get('class_type')
-    if class_type:
-        class_def = nodes.NODE_CLASS_MAPPINGS[class_type]
-    else:
-        class_def = None
+    class_type = dynprompt.get_node(unique_id)['class_type']
+    class_def = nodes.NODE_CLASS_MAPPINGS[class_type]
     if caches.outputs.get(unique_id) is not None:
         if server.client_id is not None:
             cached_output = caches.ui.get(unique_id) or {}
@@ -488,17 +485,20 @@ class PromptExecutor:
                 if self.caches.outputs.get(node_id) is not None:
                     cached_nodes.append(node_id)
 
-            # Count total nodes to execute
+            comfy.model_management.cleanup_models_gc()
+            self.add_message("execution_cached",
+                          { "nodes": cached_nodes, "prompt_id": prompt_id},
+                          broadcast=False)
+
+            # === START PROGRESS TRACKING ADDITION ===
+            # Calculate total nodes and initialize progress tracking
             total_nodes = len(prompt) - len(cached_nodes)
             if total_nodes == 0:
                 total_nodes = 1  # Avoid division by zero
             current_node = 0
             progress = 0
+            # === END PROGRESS TRACKING ADDITION ===
 
-            comfy.model_management.cleanup_models_gc()
-            self.add_message("execution_cached",
-                          { "nodes": cached_nodes, "prompt_id": prompt_id},
-                          broadcast=False)
             pending_subgraph_results = {}
             executed = set()
             execution_list = ExecutionList(dynamic_prompt, self.caches.outputs)
@@ -510,13 +510,14 @@ class PromptExecutor:
                 node_id, error, ex = execution_list.stage_node_execution()
                 if error is not None:
                     self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error, ex)
-                    return False
+                    break
 
+                # === START PROGRESS MESSAGE ADDITION ===
+                # Send progress message for each new node
                 if node_id not in executed:
                     node = dynamic_prompt.get_node(node_id)
                     class_type = node.get('class_type')
                     if class_type:
-                        # Send progress message
                         current_node += 1
                         progress = int((current_node / total_nodes) * 100)
                         self.add_message("node_executing", {
@@ -529,6 +530,8 @@ class PromptExecutor:
                                 "percentage": progress
                             }
                         }, broadcast=False)
+                # === END PROGRESS MESSAGE ADDITION ===
+
                 result, error, ex = execute(self.server, dynamic_prompt, self.caches, node_id, extra_data, executed, prompt_id, execution_list, pending_subgraph_results)
                 self.success = result != ExecutionResult.FAILURE
                 if result == ExecutionResult.FAILURE:
@@ -565,13 +568,10 @@ def validate_inputs(prompt, item, validated):
         return validated[unique_id]
 
     inputs = prompt[unique_id]['inputs']
-    class_type = prompt[unique_id].get('class_type')
-    if class_type:
-        obj_class = nodes.NODE_CLASS_MAPPINGS[class_type]
-    else:
-        obj_class = None
+    class_type = prompt[unique_id]['class_type']
+    obj_class = nodes.NODE_CLASS_MAPPINGS[class_type]
 
-    class_inputs = obj_class.INPUT_TYPES() if obj_class else {}
+    class_inputs = obj_class.INPUT_TYPES()
     valid_inputs = set(class_inputs.get('required',{})).union(set(class_inputs.get('optional',{})))
 
     errors = []
@@ -801,11 +801,8 @@ def validate_prompt(prompt):
             }
             return (False, error, [], [])
 
-        class_type = prompt[x].get('class_type')
-        if class_type:
-            class_ = nodes.NODE_CLASS_MAPPINGS.get(class_type, None)
-        else:
-            class_ = None
+        class_type = prompt[x]['class_type']
+        class_ = nodes.NODE_CLASS_MAPPINGS.get(class_type, None)
         if class_ is None:
             error = {
                 "type": "invalid_prompt",
@@ -870,7 +867,7 @@ def validate_prompt(prompt):
                 # So don't return those nodes as having errors in the response.
                 if valid is not True and len(reasons) > 0:
                     if node_id not in node_errors:
-                        class_type = prompt[node_id].get('class_type')
+                        class_type = prompt[node_id]['class_type']
                         node_errors[node_id] = {
                             "errors": reasons,
                             "dependent_outputs": [],

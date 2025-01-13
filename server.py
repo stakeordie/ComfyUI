@@ -109,17 +109,38 @@ def is_loopback(host):
 
 
 def create_origin_only_middleware():
-    origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
-    
     @web.middleware
-    async def origin_only_middleware(request, handler):
-        if request.headers.get("Origin"):
-            origin = request.headers.get("Origin")
-            if origin in origins:
-                response = await handler(request)
-                response.headers['Access-Control-Allow-Origin'] = origin
-                return response
-        return await handler(request)
+    async def origin_only_middleware(request: web.Request, handler):
+        #this code is used to prevent the case where a random website can queue comfy workflows by making a POST to 127.0.0.1 which browsers don't prevent for some dumb reason.
+        #in that case the Host and Origin hostnames won't match
+        #I know the proper fix would be to add a cookie but this should take care of the problem in the meantime
+        if 'Host' in request.headers and 'Origin' in request.headers:
+            host = request.headers['Host']
+            origin = request.headers['Origin']
+            host_domain = host.lower()
+            parsed = urllib.parse.urlparse(origin)
+            origin_domain = parsed.netloc.lower()
+            host_domain_parsed = urllib.parse.urlsplit('//' + host_domain)
+
+            #limit the check to when the host domain is localhost, this makes it slightly less safe but should still prevent the exploit
+            loopback = is_loopback(host_domain_parsed.hostname)
+
+            if parsed.port is None: #if origin doesn't have a port strip it from the host to handle weird browsers, same for host
+                host_domain = host_domain_parsed.hostname
+            if host_domain_parsed.port is None:
+                origin_domain = parsed.hostname
+
+            if loopback and host_domain is not None and origin_domain is not None and len(host_domain) > 0 and len(origin_domain) > 0:
+                if host_domain != origin_domain:
+                    logging.warning("WARNING: request with non matching host and origin {} != {}, returning 403".format(host_domain, origin_domain))
+                    return web.Response(status=403)
+
+        if request.method == "OPTIONS":
+            response = web.Response()
+        else:
+            response = await handler(request)
+
+        return response
 
     return origin_only_middleware
 
@@ -166,7 +187,18 @@ class PromptServer():
         async def websocket_handler(request):
             ws = web.WebSocketResponse()
             await ws.prepare(request)
-            sid = str(uuid.uuid4())
+
+            # === START WEBSOCKET CHANGES ===
+            # Original code:
+            # sid = request.rel_url.query.get('clientId', '')
+            # if sid:
+            #     # Reusing existing session, remove old
+            #     self.sockets.pop(sid, None)
+            # else:
+            #     sid = uuid.uuid4().hex
+
+            # New code - always generate new ID and send to client
+            sid = uuid.uuid4().hex
             self.sockets[sid] = ws
             
             # Send client ID immediately after connection
@@ -176,17 +208,31 @@ class PromptServer():
                     "client_id": sid
                 }
             }))
+            # === END WEBSOCKET CHANGES ===
             
             try:
+                # Send initial state to the new client
+                await self.send("status", { "status": self.get_queue_info(), 'sid': sid }, sid)
+                # On reconnect if we are the currently executing client send the current node
+                if self.client_id == sid and self.last_node_id is not None:
+                    await self.send("executing", { "node": self.last_node_id }, sid)
+
                 async for msg in ws:
+                    # === START WEBSOCKET MESSAGE HANDLING CHANGES ===
+                    # Original code:
+                    # if msg.type == aiohttp.WSMsgType.ERROR:
+                    #     logging.warning('ws connection closed with exception %s' % ws.exception())
+
+                    # New code - handle ping/pong and prompt messages
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         try:
                             data = json.loads(msg.data)
                             if data.get('type') == 'ping':
-                                await ws.send_str(json.dumps({"type": "pong"}))
+                                await ws.send_str(json.dumps({'type': 'pong'}))
                             elif data.get('type') == 'prompt':
                                 prompt_data = data.get('data', {})
                                 prompt_data = self.trigger_on_prompt(prompt_data)
+                                
                                 if 'prompt' in prompt_data:
                                     prompt = prompt_data['prompt']
                                     valid = execution.validate_prompt(prompt)
@@ -206,17 +252,16 @@ class PromptServer():
                                             'number': number,
                                             'node_errors': valid[3]
                                         }, sid)
-                                else:
-                                    await self.send('error', {
-                                        'error': valid[1],
-                                        'node_errors': valid[3]
-                                    }, sid)
-                        except json.JSONDecodeError:
-                            await self.send('error', {'error': 'Invalid JSON'}, sid)
+                                    else:
+                                        await self.send('error', {
+                                            'error': valid[1],
+                                            'node_errors': valid[3],
+                                        }, sid)
                         except Exception as e:
-                            await self.send('error', {'error': str(e)}, sid)
+                            logging.error(f"Error handling websocket message: {e}")
                     elif msg.type == aiohttp.WSMsgType.ERROR:
-                        logging.warning('ws connection closed with exception %s' % ws.exception())
+                        logging.error('WS connection closed with exception %s' % ws.exception())
+                    # === END WEBSOCKET MESSAGE HANDLING CHANGES ===
             finally:
                 self.sockets.pop(sid, None)
             return ws
@@ -624,7 +669,7 @@ class PromptServer():
         @routes.post("/prompt")
         async def post_prompt(request):
             logging.info("got prompt")
-            json_data = await request.json()
+            json_data =  await request.json()
             json_data = self.trigger_on_prompt(json_data)
 
             if "number" in json_data:
@@ -634,14 +679,18 @@ class PromptServer():
                 if "front" in json_data:
                     if json_data['front']:
                         number = -number
+
                 self.number += 1
 
             if "prompt" in json_data:
                 prompt = json_data["prompt"]
                 valid = execution.validate_prompt(prompt)
-                extra_data = json_data.get("extra_data", {})
-                # For REST/UI requests, we don't set client_id since there's no WebSocket to send messages to
-                
+                extra_data = {}
+                if "extra_data" in json_data:
+                    extra_data = json_data["extra_data"]
+
+                if "client_id" in json_data:
+                    extra_data["client_id"] = json_data["client_id"]
                 if valid[0]:
                     prompt_id = str(uuid.uuid4())
                     outputs_to_execute = valid[2]
@@ -737,25 +786,12 @@ class PromptServer():
         return prompt_info
 
     async def send(self, event, data, sid=None):
-        if event == "node_executing":
-            # Format progress message
-            msg = {
-                "type": "executing",  
-                "data": {
-                    "node": data["node"],
-                    "prompt_id": data["prompt_id"],
-                    "class_type": data["class_type"],
-                    "progress": data["progress"]
-                }
-            }
+        if event == BinaryEventTypes.UNENCODED_PREVIEW_IMAGE:
+            await self.send_image(data, sid=sid)
+        elif isinstance(data, (bytes, bytearray)):
+            await self.send_bytes(event, data, sid)
         else:
-            msg = {"type": event, "data": data}
-
-        if sid is None:
-            for client in self.sockets.values():
-                await client.send_str(json.dumps(msg))
-        elif sid in self.sockets:
-            await self.sockets[sid].send_str(json.dumps(msg))
+            await self.send_json(event, data, sid)
 
     def encode_bytes(self, event, data):
         if not isinstance(event, int):
@@ -794,19 +830,21 @@ class PromptServer():
         message = self.encode_bytes(event, data)
 
         if sid is None:
-            for client in self.sockets.values():
-                await client.send_bytes(message)
+            sockets = list(self.sockets.values())
+            for ws in sockets:
+                await send_socket_catch_exception(ws.send_bytes, message)
         elif sid in self.sockets:
-            await self.sockets[sid].send_bytes(message)
+            await send_socket_catch_exception(self.sockets[sid].send_bytes, message)
 
     async def send_json(self, event, data, sid=None):
         message = {"type": event, "data": data}
 
         if sid is None:
-            for client in self.sockets.values():
-                await client.send_json(message)
+            sockets = list(self.sockets.values())
+            for ws in sockets:
+                await send_socket_catch_exception(ws.send_json, message)
         elif sid in self.sockets:
-            await self.sockets[sid].send_json(message)
+            await send_socket_catch_exception(self.sockets[sid].send_json, message)
 
     def send_sync(self, event, data, sid=None):
         self.loop.call_soon_threadsafe(
