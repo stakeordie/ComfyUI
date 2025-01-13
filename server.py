@@ -129,8 +129,6 @@ def create_origin_only_middleware():
 
         return response
 
-    return origin_only_middleware
-
 class PromptServer():
     def __init__(self, loop):
         PromptServer.instance = self
@@ -194,6 +192,61 @@ class PromptServer():
                 async for msg in ws:
                     if msg.type == aiohttp.WSMsgType.ERROR:
                         logging.warning('ws connection closed with exception %s' % ws.exception())
+                    elif msg.type == aiohttp.WSMsgType.TEXT:
+                        try:
+                            data = json.loads(msg.data)
+                            message_type = data.get('type')
+                            
+                            if message_type == 'execute_prompt':
+                                # Handle prompt execution
+                                prompt_data = data.get('data', {})
+                                prompt_data['client_id'] = sid  # Attach client ID
+                                
+                                # Reuse existing post_prompt logic
+                                prompt_data = self.trigger_on_prompt(prompt_data)
+                                
+                                if "prompt" in prompt_data:
+                                    prompt = prompt_data["prompt"]
+                                    valid = execution.validate_prompt(prompt)
+                                    extra_data = prompt_data.get('extra_data', {})
+                                    extra_data['client_id'] = sid
+                                    
+                                    if valid[0]:
+                                        prompt_id = str(uuid.uuid4())
+                                        number = float(prompt_data.get('number', self.number))
+                                        if 'front' in prompt_data and prompt_data['front']:
+                                            number = -number
+                                        outputs_to_execute = valid[2]
+                                        
+                                        # Queue the prompt
+                                        self.prompt_queue.put((number, prompt_id, prompt, extra_data, outputs_to_execute))
+                                        
+                                        # Send response back through WebSocket
+                                        await self.send("prompt_response", {
+                                            "success": True,
+                                            "prompt_id": prompt_id,
+                                            "number": number,
+                                            "node_errors": valid[3]
+                                        }, sid)
+                                    else:
+                                        await self.send("prompt_response", {
+                                            "success": False,
+                                            "error": valid[1],
+                                            "node_errors": valid[3]
+                                        }, sid)
+                                else:
+                                    await self.send("prompt_response", {
+                                        "success": False,
+                                        "error": "no prompt",
+                                        "node_errors": []
+                                    }, sid)
+                                    
+                        except json.JSONDecodeError:
+                            logging.warning('Invalid JSON received through WebSocket')
+                            await self.send("error", {"message": "Invalid JSON format"}, sid)
+                        except Exception as e:
+                            logging.error(f'Error processing WebSocket message: {str(e)}')
+                            await self.send("error", {"message": str(e)}, sid)
             finally:
                 self.sockets.pop(sid, None)
             return ws
