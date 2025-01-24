@@ -488,6 +488,16 @@ class PromptExecutor:
             self.add_message("execution_cached",
                           { "nodes": cached_nodes, "prompt_id": prompt_id},
                           broadcast=False)
+
+            # === START PROGRESS TRACKING ADDITION ===
+            # Calculate total nodes and initialize progress tracking
+            total_nodes = len(prompt) - len(cached_nodes)
+            if total_nodes == 0:
+                total_nodes = 1  # Avoid division by zero
+            current_node = 0
+            progress = 0
+            # === END PROGRESS TRACKING ADDITION ===
+
             pending_subgraph_results = {}
             executed = set()
             execution_list = ExecutionList(dynamic_prompt, self.caches.outputs)
@@ -500,6 +510,26 @@ class PromptExecutor:
                 if error is not None:
                     self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error, ex)
                     break
+
+                # === START PROGRESS MESSAGE ADDITION ===
+                # Send progress message for each new node
+                if node_id not in executed:
+                    node = dynamic_prompt.get_node(node_id)
+                    class_type = node.get('class_type')
+                    if class_type:
+                        current_node += 1
+                        progress = int((current_node / total_nodes) * 100)
+                        self.add_message("node_executing", {
+                            "node": node_id,
+                            "prompt_id": prompt_id,
+                            "class_type": class_type,
+                            "progress": {
+                                "current": current_node,
+                                "total": total_nodes,
+                                "percentage": progress
+                            }
+                        }, broadcast=False)
+                # === END PROGRESS MESSAGE ADDITION ===
 
                 result, error, ex = execute(self.server, dynamic_prompt, self.caches, node_id, extra_data, executed, prompt_id, execution_list, pending_subgraph_results)
                 self.success = result != ExecutionResult.FAILURE

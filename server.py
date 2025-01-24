@@ -175,15 +175,29 @@ class PromptServer():
         async def websocket_handler(request):
             ws = web.WebSocketResponse()
             await ws.prepare(request)
-            sid = request.rel_url.query.get('clientId', '')
-            if sid:
-                # Reusing existing session, remove old
-                self.sockets.pop(sid, None)
-            else:
-                sid = uuid.uuid4().hex
 
+            # === START WEBSOCKET CHANGES ===
+            # Original code:
+            # sid = request.rel_url.query.get('clientId', '')
+            # if sid:
+            #     # Reusing existing session, remove old
+            #     self.sockets.pop(sid, None)
+            # else:
+            #     sid = uuid.uuid4().hex
+
+            # New code - always generate new ID and send to client
+            sid = uuid.uuid4().hex
             self.sockets[sid] = ws
-
+            
+            # Send client ID immediately after connection
+            await ws.send_str(json.dumps({
+                "type": "client_id",
+                "data": {
+                    "client_id": sid
+                }
+            }))
+            # === END WEBSOCKET CHANGES ===
+            
             try:
                 # Send initial state to the new client
                 await self.send("status", { "status": self.get_queue_info(), 'sid': sid }, sid)
@@ -192,8 +206,50 @@ class PromptServer():
                     await self.send("executing", { "node": self.last_node_id }, sid)
 
                 async for msg in ws:
-                    if msg.type == aiohttp.WSMsgType.ERROR:
-                        logging.warning('ws connection closed with exception %s' % ws.exception())
+                    # === START WEBSOCKET MESSAGE HANDLING CHANGES ===
+                    # Original code:
+                    # if msg.type == aiohttp.WSMsgType.ERROR:
+                    #     logging.warning('ws connection closed with exception %s' % ws.exception())
+
+                    # New code - handle ping/pong and prompt messages
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        try:
+                            data = json.loads(msg.data)
+                            if data.get('type') == 'ping':
+                                await ws.send_str(json.dumps({'type': 'pong'}))
+                            elif data.get('type') == 'prompt':
+                                prompt_data = data.get('data', {})
+                                prompt_data = self.trigger_on_prompt(prompt_data)
+                                
+                                if 'prompt' in prompt_data:
+                                    prompt = prompt_data['prompt']
+                                    valid = execution.validate_prompt(prompt)
+                                    if valid[0]:
+                                        prompt_id = str(uuid.uuid4())
+                                        number = self.number
+                                        self.number += 1
+                                        
+                                        # Add client_id to extra_data for progress tracking
+                                        extra_data = prompt_data.get('extra_data', {})
+                                        extra_data['client_id'] = sid
+                                        
+                                        outputs_to_execute = valid[2]
+                                        self.prompt_queue.put((number, prompt_id, prompt, extra_data, outputs_to_execute))
+                                        await self.send('prompt_queued', {
+                                            'prompt_id': prompt_id,
+                                            'number': number,
+                                            'node_errors': valid[3]
+                                        }, sid)
+                                    else:
+                                        await self.send('error', {
+                                            'error': valid[1],
+                                            'node_errors': valid[3],
+                                        }, sid)
+                        except Exception as e:
+                            logging.error(f"Error handling websocket message: {e}")
+                    elif msg.type == aiohttp.WSMsgType.ERROR:
+                        logging.error('WS connection closed with exception %s' % ws.exception())
+                    # === END WEBSOCKET MESSAGE HANDLING CHANGES ===
             finally:
                 self.sockets.pop(sid, None)
             return ws
